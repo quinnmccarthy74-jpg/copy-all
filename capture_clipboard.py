@@ -406,11 +406,6 @@ class CaptureWriter:
         self.pending_save = False
         self.started = _dt.datetime.now()
 
-    @property
-    def images_dir(self) -> str:
-        stem = os.path.splitext(self.path)[0]
-        return f"{stem}_images"
-
     def add_capture(self, ops: list[tuple], source_url: str | None, fetcher: ImageFetcher) -> int:
         self.count += 1
         stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -438,15 +433,6 @@ class CaptureWriter:
 
     def _save(self) -> None:
         raise NotImplementedError
-
-    # -- shared image helper ----------------------------------------------
-    def _save_image_file(self, image: ImageData, number: int) -> str:
-        """Write a picture into the sibling images folder; return its relative path."""
-        os.makedirs(self.images_dir, exist_ok=True)
-        name = f"img_{number:04d}{image.ext}"
-        with open(os.path.join(self.images_dir, name), "wb") as fh:
-            fh.write(image.data)
-        return f"{os.path.basename(self.images_dir)}/{name}"
 
 
 class DocxWriter(CaptureWriter):
@@ -509,7 +495,8 @@ class DocxWriter(CaptureWriter):
 
 
 class TextishWriter(CaptureWriter):
-    """Base for the plain-text formats: lines in memory, pictures in a folder."""
+    """Base for the plain-text formats. These are words only: pictures are
+    skipped rather than saved, so nothing is downloaded for them."""
 
     def __init__(self, path: str) -> None:
         super().__init__(path)
@@ -525,18 +512,18 @@ class TextishWriter(CaptureWriter):
 
 
 class MarkdownWriter(TextishWriter):
-    """A .md file; pictures are saved beside it and linked with ![](...)."""
+    """A .md file, text only."""
 
     def _header(self) -> None:
         self.lines += ["# Clipboard capture", "",
                        f"Session started {self.started:%Y-%m-%d %H:%M:%S}", ""]
 
     def _write_capture(self, ops, source_url, fetcher, stamp) -> int:
+        """Returns 0 always: this format carries no pictures."""
         self.lines += ["---", "", f"## Capture {self.count} - {stamp}", ""]
         if source_url:
             self.lines += [f"<{source_url}>", ""]
 
-        added = 0
         previous = None
         for op in ops:
             kind = op[0]
@@ -550,22 +537,13 @@ class MarkdownWriter(TextishWriter):
                 self.lines += ["```", *op[1].split("\n"), "```", ""]
             elif kind == "li":
                 self.lines.append("  " * (max(1, op[2]) - 1) + f"- {op[1]}")
-            elif kind in ("img", "rawimg"):
-                alt = op[2] if kind == "img" else ""
-                image = _resolve_image(op, fetcher)
-                if image:
-                    rel = self._save_image_file(image, self.images + added + 1)
-                    added += 1
-                    self.lines += [f"![{alt}]({rel})", ""]
-                elif alt:
-                    self.lines += [f"*[image not saved: {alt}]*", ""]
             previous = kind
         self.lines.append("")
-        return added
+        return 0
 
 
 class TextWriter(TextishWriter):
-    """A .txt file; pictures are saved beside it and referenced by filename."""
+    """A .txt file, text only."""
 
     RULE = "=" * 78
 
@@ -574,12 +552,12 @@ class TextWriter(TextishWriter):
                        f"Session started {self.started:%Y-%m-%d %H:%M:%S}", ""]
 
     def _write_capture(self, ops, source_url, fetcher, stamp) -> int:
+        """Returns 0 always: this format carries no pictures."""
         self.lines += ["", self.RULE, f"CAPTURE {self.count}  -  {stamp}"]
         if source_url:
             self.lines.append(source_url)
         self.lines += [self.RULE, ""]
 
-        added = 0
         previous = None
         for op in ops:
             kind = op[0]
@@ -594,19 +572,9 @@ class TextWriter(TextishWriter):
                 self.lines.append("")
             elif kind == "li":
                 self.lines.append("  " * max(1, op[2]) + f"- {op[1]}")
-            elif kind in ("img", "rawimg"):
-                alt = op[2] if kind == "img" else ""
-                image = _resolve_image(op, fetcher)
-                if image:
-                    rel = self._save_image_file(image, self.images + added + 1)
-                    added += 1
-                    label = f"{rel}  -  {alt}" if alt else rel
-                    self.lines += ["", f"[image: {label}]", ""]
-                elif alt:
-                    self.lines += [f"[image not saved: {alt}]", ""]
             previous = kind
         self.lines.append("")
-        return added
+        return 0
 
 
 def _resolve_image(op: tuple, fetcher: ImageFetcher) -> ImageData | None:
@@ -625,10 +593,12 @@ WRITERS = {"docx": DocxWriter, "md": MarkdownWriter, "txt": TextWriter}
 # --------------------------------------------------------------------------
 
 CHOICES = [
-    ("docx", "Word document", ".docx", "pictures embedded in the file itself"),
-    ("md", "Markdown file", ".md", "pictures saved in a folder beside it"),
-    ("txt", "Plain text file", ".txt", "pictures saved in a folder beside it"),
+    ("docx", "Word document", ".docx", "text and pictures"),
+    ("md", "Markdown file", ".md", "text only"),
+    ("txt", "Plain text file", ".txt", "text only"),
 ]
+
+TEXT_ONLY = {"md", "txt"}
 
 
 def ask_format(default: str = "docx") -> str:
@@ -689,7 +659,7 @@ def parse_args(argv=None):
     ap.add_argument("--interval", type=float, default=0.4,
                     help="seconds between clipboard checks (default 0.4)")
     ap.add_argument("--no-images", action="store_true",
-                    help="capture text only; do not download or embed pictures")
+                    help="text only, even for docx (md and txt are text only anyway)")
     ap.add_argument("--min-image-size", type=int, default=32,
                     help="skip images smaller than this many pixels on a side (default 32)")
     ap.add_argument("--image-timeout", type=float, default=10.0,
@@ -715,10 +685,12 @@ def main(argv=None) -> int:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     doc = WRITERS[fmt](out_path)
 
+    want_images = not args.no_images and fmt not in TEXT_ONLY
+
     print("Clipboard capture running.")
     print(f"  Writing to: {out_path}")
-    if fmt != "docx" and not args.no_images:
-        print(f"  Pictures:   {doc.images_dir}\\")
+    if not want_images:
+        print("  Text only - pictures are skipped.")
     print("  Copy anything (Ctrl+A then Ctrl+C on a page) and it gets appended.")
     print("  Press Ctrl+C here to stop.\n")
 
@@ -743,10 +715,11 @@ def main(argv=None) -> int:
             elif clip["text"]:
                 ops = ops_from_text(clip["text"])
 
-            if clip["bitmap"] and not args.no_images:
+            if clip["bitmap"] and want_images:
                 ops.append(("rawimg", clip["bitmap"]))
 
-            if args.no_images:
+            if not want_images:
+                # Skip them here so a text-only run never touches the network.
                 ops = [op for op in ops if op[0] not in ("img", "rawimg")]
 
             text_len = sum(len(op[1]) for op in ops if op[0] in ("p", "pre", "li")) + \
@@ -770,16 +743,18 @@ def main(argv=None) -> int:
             )
             n_img = doc.add_capture(ops, source_url, fetcher)
             label = source_url or ("image" if has_image and text_len == 0 else "clipboard text")
-            print(f"[{doc.count}] {text_len} chars, {n_img} image(s)  <- {label}")
+            counts = f"{text_len} chars" if not want_images else f"{text_len} chars, {n_img} image(s)"
+            print(f"[{doc.count}] {counts}  <- {label}")
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
         if doc.count:
             if doc.pending_save:
                 doc.save()
-            print(f"Saved {doc.count} capture(s) and {doc.images} image(s) to:\n  {out_path}")
-            if fmt != "docx" and doc.images:
-                print(f"  Pictures in: {doc.images_dir}")
+            tally = f"{doc.count} capture(s)"
+            if want_images:
+                tally += f" and {doc.images} image(s)"
+            print(f"Saved {tally} to:\n  {out_path}")
         else:
             print("Nothing was captured, so no file was written.")
     return 0

@@ -1,8 +1,8 @@
 # copy-all
 
 Watch the Windows clipboard and append everything you copy to a single
-document — text *and* pictures — until you stop it. Choose a **Word**, a
-**Markdown** or a **plain text** file when it starts.
+document until you stop it. Choose when it starts: a **Word** file (text and
+pictures) or a **Markdown** / **plain text** file (words only).
 
 You never touch the output file while you work. You just browse: on each page
 press **Ctrl+A** then **Ctrl+C**, and a moment later that page is another
@@ -30,9 +30,9 @@ python capture_clipboard.py
 > run-capture.bat
 What should the captures be written to?
 
-  [1] Word document    .docx   - pictures embedded in the file itself
-  [2] Markdown file    .md     - pictures saved in a folder beside it
-  [3] Plain text file  .txt    - pictures saved in a folder beside it
+  [1] Word document    .docx   - text and pictures
+  [2] Markdown file    .md     - text only
+  [3] Plain text file  .txt    - text only
 
 Choose 1-3 [1]: 1
 
@@ -66,7 +66,7 @@ so you are not asked.
 | --- | --- |
 | `--format`, `-f` | `docx`, `md` or `txt` — skips the startup question |
 | `--out PATH`, `-o` | Where to write it. Default: `Documents\clipboard-capture_<date>.<ext>` |
-| `--no-images` | Text only — nothing is downloaded |
+| `--no-images` | Words only, even for Word format |
 | `--min-image-size N` | Skip images under N pixels a side (default 32, keeps out spacers and tracking pixels) |
 | `--image-timeout S` | How long to wait per image download (default 10s) |
 | `--min-chars N` | Ignore copies shorter than N characters |
@@ -84,18 +84,13 @@ in the order they appeared:
 - headings, paragraphs and bullet lists
 - tables, flattened to one line per row with `|` between cells
 - preformatted / code blocks (fenced in Markdown, indented in text)
-- images, with the `alt` text kept as a caption
+- images, in the Word format only
 
-Where the pictures go depends on the format:
-
-| Format | Pictures |
-| --- | --- |
-| `.docx` | embedded in the file, scaled to the page width — one self-contained file to send |
-| `.md` | saved as `img_0001.png`, `img_0002.jpg`, … in a `<name>_images` folder beside the file and linked with `![alt](...)` |
-| `.txt` | same folder, referenced as `[image: <name>_images/img_0001.png - alt text]` |
-
-For `.md` and `.txt`, keep that folder next to the file if you move it, or the
-pictures stop resolving.
+Pictures only apply to the Word format, where they are embedded in the file
+itself, scaled to the page width, with the `alt` text as a caption — one
+self-contained file to send. **Markdown and plain text are words only**:
+pictures are skipped, and because of that those two formats never touch the
+network, so each capture is instant.
 
 ## Worth knowing
 
@@ -103,7 +98,7 @@ pictures stop resolving.
   runs — including a password or a card number pasted between apps. Stop it
   before you do anything private, and keep in mind the output file is plain,
   unencrypted `.docx`.
-- **Images are fetched over the network** from the page you copied, using that
+- **Images are fetched over the network** (Word format only) from the page you copied, using that
   page's URL as the referer. An image behind a login or a hotlink block can't
   be fetched; you get an `[image not saved: alt text]` line instead so you know
   something was there. Images pasted as data URIs, and screenshots copied
