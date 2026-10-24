@@ -1,11 +1,15 @@
-"""Watch the Windows clipboard and append everything you copy to a Word document.
+"""Watch the Windows clipboard and append everything you copy to a document.
 
 Run it, then go about your browsing. Every time you press Ctrl+A / Ctrl+C on a
 page (or copy a single image), this appends the content -- text and pictures --
-as a new section of a .docx file. Press Ctrl+C in the console window to stop.
+as a new section of the document. Press Ctrl+C in the console window to stop.
+
+On start it asks whether to write a Word document, a Markdown file or a plain
+text file; pass --format to skip the question.
 
 Usage:
     python capture_clipboard.py
+    python capture_clipboard.py --format md
     python capture_clipboard.py --out "C:\\Users\\me\\Desktop\\research.docx"
 
 Requires: pywin32, Pillow, python-docx  (see requirements.txt)
@@ -27,6 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
+from typing import NamedTuple
 
 try:
     import win32clipboard
@@ -52,6 +57,16 @@ USER_AGENT = (
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 PAGE_WIDTH_INCHES = 6.0
 EMBEDDABLE = {"PNG", "JPEG", "GIF", "BMP", "TIFF"}
+EXTENSIONS = {"PNG": ".png", "JPEG": ".jpg", "GIF": ".gif", "BMP": ".bmp", "TIFF": ".tif"}
+FORMATS = {"docx": ".docx", "md": ".md", "txt": ".txt"}
+
+
+class ImageData(NamedTuple):
+    """A picture ready to be written: normalised bytes plus how to place it."""
+    data: bytes
+    width_in: float
+    height_in: float
+    ext: str
 
 
 # --------------------------------------------------------------------------
@@ -130,7 +145,11 @@ def split_cf_html(raw: str) -> tuple[str, str | None]:
 # --------------------------------------------------------------------------
 
 class PageParser(HTMLParser):
-    """Flatten HTML into ordered ops: ('h', level, text) ('p', text) ('li', text, depth) ('img', url, alt)."""
+    """Flatten HTML into ordered ops.
+
+    Ops are ('h', level, text), ('p', text), ('pre', text),
+    ('li', text, depth) and ('img', url, alt).
+    """
 
     SKIP = {"script", "style", "head", "noscript", "svg", "iframe", "object", "template", "select"}
     BLOCK = {
@@ -171,6 +190,8 @@ class PageParser(HTMLParser):
             return
         if self._heading is not None:
             self.ops.append(("h", self._heading, text))
+        elif self._in_pre:
+            self.ops.append(("pre", text))
         elif self._in_li:
             self.ops.append(("li", text, max(1, self._list_depth)))
         else:
@@ -332,8 +353,8 @@ class ImageFetcher:
         except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
             return None
 
-    def prepare(self, data: bytes) -> tuple[bytes, float, float] | None:
-        """Normalise to something Word accepts; return (bytes, width_in, height_in)."""
+    def prepare(self, data: bytes) -> "ImageData | None":
+        """Normalise to something a document can embed, or None if unusable."""
         if not data or len(data) > MAX_IMAGE_BYTES:
             return None
         try:
@@ -349,13 +370,14 @@ class ImageFetcher:
             buf = io.BytesIO()
             img.convert("RGBA" if img.mode in ("RGBA", "LA", "P") else "RGB").save(buf, format="PNG")
             data = buf.getvalue()
+            fmt = "PNG"
 
         width_in = img.width / 96.0
         height_in = img.height / 96.0
         if width_in > PAGE_WIDTH_INCHES:
             height_in *= PAGE_WIDTH_INCHES / width_in
             width_in = PAGE_WIDTH_INCHES
-        return data, width_in, height_in
+        return ImageData(data, width_in, height_in, EXTENSIONS.get(fmt, ".png"))
 
 
 def _decode_data_uri(url: str) -> bytes | None:
@@ -371,24 +393,73 @@ def _decode_data_uri(url: str) -> bytes | None:
 
 
 # --------------------------------------------------------------------------
-# Document building
+# Document writers
 # --------------------------------------------------------------------------
 
-class CaptureDoc:
+class CaptureWriter:
+    """Common behaviour: count captures, save after each one, survive a lock."""
+
     def __init__(self, path: str) -> None:
         self.path = path
-        self.doc = Document()
         self.count = 0
         self.images = 0
         self.pending_save = False
-        self.doc.add_heading("Clipboard capture", level=0)
-        stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        intro = self.doc.add_paragraph(f"Session started {stamp}")
-        intro.runs[0].font.size = Pt(9)
+        self.started = _dt.datetime.now()
+
+    @property
+    def images_dir(self) -> str:
+        stem = os.path.splitext(self.path)[0]
+        return f"{stem}_images"
 
     def add_capture(self, ops: list[tuple], source_url: str | None, fetcher: ImageFetcher) -> int:
         self.count += 1
         stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        added = self._write_capture(ops, source_url, fetcher, stamp)
+        self.images += added
+        self.save()
+        return added
+
+    def save(self) -> None:
+        """Save after every capture so nothing is lost if the script is killed."""
+        try:
+            self._save()
+            self.pending_save = False
+        except PermissionError:
+            self.pending_save = True
+            print(f"  ! Could not write {self.path} (is it open in another program?). "
+                  f"Everything is still held in memory and will be saved on the next capture.")
+        except Exception as exc:
+            self.pending_save = True
+            print(f"  ! Could not write {self.path}: {exc}")
+
+    # -- subclass hooks ---------------------------------------------------
+    def _write_capture(self, ops, source_url, fetcher, stamp) -> int:
+        raise NotImplementedError
+
+    def _save(self) -> None:
+        raise NotImplementedError
+
+    # -- shared image helper ----------------------------------------------
+    def _save_image_file(self, image: ImageData, number: int) -> str:
+        """Write a picture into the sibling images folder; return its relative path."""
+        os.makedirs(self.images_dir, exist_ok=True)
+        name = f"img_{number:04d}{image.ext}"
+        with open(os.path.join(self.images_dir, name), "wb") as fh:
+            fh.write(image.data)
+        return f"{os.path.basename(self.images_dir)}/{name}"
+
+
+class DocxWriter(CaptureWriter):
+    """A single .docx with the pictures embedded inside the file."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self.doc = Document()
+        self.doc.add_heading("Clipboard capture", level=0)
+        intro = self.doc.add_paragraph(f"Session started {self.started:%Y-%m-%d %H:%M:%S}")
+        intro.runs[0].font.size = Pt(9)
+
+    def _write_capture(self, ops, source_url, fetcher, stamp) -> int:
         if self.count > 1:
             self.doc.add_page_break()
         self.doc.add_heading(f"Capture {self.count} - {stamp}", level=1)
@@ -396,47 +467,36 @@ class CaptureDoc:
             p = self.doc.add_paragraph(source_url)
             p.runs[0].font.size = Pt(9)
 
-        added_images = 0
+        added = 0
         for op in ops:
             kind = op[0]
             if kind == "h":
                 self.doc.add_heading(op[2], level=min(op[1] + 1, 9))
             elif kind == "p":
                 self.doc.add_paragraph(op[1])
+            elif kind == "pre":
+                para = self.doc.add_paragraph(op[1])
+                for run in para.runs:
+                    run.font.name = "Consolas"
+                    run.font.size = Pt(9)
             elif kind == "li":
                 style = "List Bullet" if op[2] <= 1 else f"List Bullet {min(op[2], 3)}"
                 try:
                     self.doc.add_paragraph(op[1], style=style)
                 except KeyError:
                     self.doc.add_paragraph(f"- {op[1]}")
-            elif kind == "img":
-                if self._add_image(op[1], op[2], fetcher):
-                    added_images += 1
-            elif kind == "rawimg":
-                if self._add_raw_image(op[1], fetcher):
-                    added_images += 1
-        self.images += added_images
-        self.save()
-        return added_images
+            elif kind in ("img", "rawimg"):
+                image = _resolve_image(op, fetcher)
+                if image and self._place(image, op[2] if kind == "img" else ""):
+                    added += 1
+                elif kind == "img" and op[2]:
+                    note = self.doc.add_paragraph(f"[image not saved: {op[2]}]")
+                    note.runs[0].font.size = Pt(9)
+        return added
 
-    def _add_image(self, url: str, alt: str, fetcher: ImageFetcher) -> bool:
-        raw = fetcher.fetch(url)
-        prepared = fetcher.prepare(raw) if raw else None
-        if not prepared:
-            if alt:
-                note = self.doc.add_paragraph(f"[image not saved: {alt}]")
-                note.runs[0].font.size = Pt(9)
-            return False
-        return self._place(prepared, alt)
-
-    def _add_raw_image(self, data: bytes, fetcher: ImageFetcher) -> bool:
-        prepared = fetcher.prepare(data)
-        return self._place(prepared, "") if prepared else False
-
-    def _place(self, prepared: tuple[bytes, float, float], alt: str) -> bool:
-        data, width_in, _ = prepared
+    def _place(self, image: ImageData, alt: str) -> bool:
         try:
-            self.doc.add_picture(io.BytesIO(data), width=Inches(width_in))
+            self.doc.add_picture(io.BytesIO(image.data), width=Inches(image.width_in))
         except Exception:
             return False
         if alt:
@@ -444,37 +504,188 @@ class CaptureDoc:
             cap.runs[0].font.size = Pt(8)
         return True
 
-    def save(self) -> None:
-        """Save after every capture so nothing is lost if the script is killed."""
+    def _save(self) -> None:
+        self.doc.save(self.path)
+
+
+class TextishWriter(CaptureWriter):
+    """Base for the plain-text formats: lines in memory, pictures in a folder."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self.lines: list[str] = []
+        self._header()
+
+    def _header(self) -> None:
+        raise NotImplementedError
+
+    def _save(self) -> None:
+        with open(self.path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(self.lines).rstrip() + "\n")
+
+
+class MarkdownWriter(TextishWriter):
+    """A .md file; pictures are saved beside it and linked with ![](...)."""
+
+    def _header(self) -> None:
+        self.lines += ["# Clipboard capture", "",
+                       f"Session started {self.started:%Y-%m-%d %H:%M:%S}", ""]
+
+    def _write_capture(self, ops, source_url, fetcher, stamp) -> int:
+        self.lines += ["---", "", f"## Capture {self.count} - {stamp}", ""]
+        if source_url:
+            self.lines += [f"<{source_url}>", ""]
+
+        added = 0
+        previous = None
+        for op in ops:
+            kind = op[0]
+            if previous == "li" and kind != "li":
+                self.lines.append("")  # blank line closes the list block
+            if kind == "h":
+                self.lines += ["#" * min(op[1] + 2, 6) + " " + op[2], ""]
+            elif kind == "p":
+                self.lines += [op[1], ""]
+            elif kind == "pre":
+                self.lines += ["```", *op[1].split("\n"), "```", ""]
+            elif kind == "li":
+                self.lines.append("  " * (max(1, op[2]) - 1) + f"- {op[1]}")
+            elif kind in ("img", "rawimg"):
+                alt = op[2] if kind == "img" else ""
+                image = _resolve_image(op, fetcher)
+                if image:
+                    rel = self._save_image_file(image, self.images + added + 1)
+                    added += 1
+                    self.lines += [f"![{alt}]({rel})", ""]
+                elif alt:
+                    self.lines += [f"*[image not saved: {alt}]*", ""]
+            previous = kind
+        self.lines.append("")
+        return added
+
+
+class TextWriter(TextishWriter):
+    """A .txt file; pictures are saved beside it and referenced by filename."""
+
+    RULE = "=" * 78
+
+    def _header(self) -> None:
+        self.lines += ["CLIPBOARD CAPTURE",
+                       f"Session started {self.started:%Y-%m-%d %H:%M:%S}", ""]
+
+    def _write_capture(self, ops, source_url, fetcher, stamp) -> int:
+        self.lines += ["", self.RULE, f"CAPTURE {self.count}  -  {stamp}"]
+        if source_url:
+            self.lines.append(source_url)
+        self.lines += [self.RULE, ""]
+
+        added = 0
+        previous = None
+        for op in ops:
+            kind = op[0]
+            if previous == "li" and kind != "li":
+                self.lines.append("")
+            if kind == "h":
+                self.lines += [op[2], "-" * len(op[2]), ""]
+            elif kind == "p":
+                self.lines += [op[1], ""]
+            elif kind == "pre":
+                self.lines += ["    " + ln for ln in op[1].split("\n")]
+                self.lines.append("")
+            elif kind == "li":
+                self.lines.append("  " * max(1, op[2]) + f"- {op[1]}")
+            elif kind in ("img", "rawimg"):
+                alt = op[2] if kind == "img" else ""
+                image = _resolve_image(op, fetcher)
+                if image:
+                    rel = self._save_image_file(image, self.images + added + 1)
+                    added += 1
+                    label = f"{rel}  -  {alt}" if alt else rel
+                    self.lines += ["", f"[image: {label}]", ""]
+                elif alt:
+                    self.lines += [f"[image not saved: {alt}]", ""]
+            previous = kind
+        self.lines.append("")
+        return added
+
+
+def _resolve_image(op: tuple, fetcher: ImageFetcher) -> ImageData | None:
+    """Turn an 'img' (url) or 'rawimg' (bytes) op into embeddable image data."""
+    if op[0] == "rawimg":
+        return fetcher.prepare(op[1])
+    raw = fetcher.fetch(op[1])
+    return fetcher.prepare(raw) if raw else None
+
+
+WRITERS = {"docx": DocxWriter, "md": MarkdownWriter, "txt": TextWriter}
+
+
+# --------------------------------------------------------------------------
+# Startup choices
+# --------------------------------------------------------------------------
+
+CHOICES = [
+    ("docx", "Word document", ".docx", "pictures embedded in the file itself"),
+    ("md", "Markdown file", ".md", "pictures saved in a folder beside it"),
+    ("txt", "Plain text file", ".txt", "pictures saved in a folder beside it"),
+]
+
+
+def ask_format(default: str = "docx") -> str:
+    """Ask at startup, so double-clicking the launcher still offers the choice."""
+    print("What should the captures be written to?\n")
+    for n, (_key, label, ext, note) in enumerate(CHOICES, start=1):
+        print(f"  [{n}] {label:<16} {ext:<6}  - {note}")
+    default_n = [c[0] for c in CHOICES].index(default) + 1
+    print()
+    while True:
         try:
-            self.doc.save(self.path)
-            self.pending_save = False
-        except PermissionError:
-            self.pending_save = True
-            print(f"  ! Could not write {self.path} (is it open in Word?). "
-                  f"Everything is still held in memory and will be saved on the next capture.")
-        except Exception as exc:
-            self.pending_save = True
-            print(f"  ! Could not write {self.path}: {exc}")
+            answer = input(f"Choose 1-{len(CHOICES)} [{default_n}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return default
+        if not answer:
+            return default
+        if answer.isdigit() and 1 <= int(answer) <= len(CHOICES):
+            return CHOICES[int(answer) - 1][0]
+        if answer.lower() in WRITERS:
+            return answer.lower()
+        print("  Please type 1, 2 or 3.")
 
 
-# --------------------------------------------------------------------------
-# Main loop
-# --------------------------------------------------------------------------
-
-def default_out_path() -> str:
+def default_out_path(fmt: str) -> str:
     stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H%M")
     folder = os.path.join(os.path.expanduser("~"), "Documents")
     if not os.path.isdir(folder):
         folder = os.path.expanduser("~")
-    return os.path.join(folder, f"clipboard-capture_{stamp}.docx")
+    return os.path.join(folder, f"clipboard-capture_{stamp}{FORMATS[fmt]}")
+
+
+def resolve_output(args) -> tuple[str, str]:
+    """Work out (format, path) from the flags, the filename, or by asking."""
+    fmt = args.format
+    if not fmt and args.out:
+        ext = os.path.splitext(args.out)[1].lower()
+        fmt = next((k for k, v in FORMATS.items() if v == ext), None)
+    if not fmt:
+        fmt = ask_format()
+        print()
+
+    path = os.path.abspath(args.out) if args.out else default_out_path(fmt)
+    stem, ext = os.path.splitext(path)
+    if ext.lower() != FORMATS[fmt]:
+        path = stem + FORMATS[fmt]  # keep the extension honest about the contents
+    return fmt, path
 
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--format", "-f", choices=sorted(WRITERS), default=None,
+                    help="docx, md or txt. Omit to be asked at startup "
+                         "(or to take it from --out's extension)")
     ap.add_argument("--out", "-o", default=None,
-                    help="output .docx path (default: ~/Documents/clipboard-capture_<date>.docx)")
+                    help="output path (default: ~/Documents/clipboard-capture_<date>.<ext>)")
     ap.add_argument("--interval", type=float, default=0.4,
                     help="seconds between clipboard checks (default 0.4)")
     ap.add_argument("--no-images", action="store_true",
@@ -490,18 +701,24 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+# --------------------------------------------------------------------------
+# Main loop
+# --------------------------------------------------------------------------
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     if os.name != "nt":
         print("This script uses the Windows clipboard API and only runs on Windows.")
         return 1
 
-    out_path = os.path.abspath(args.out or default_out_path())
+    fmt, out_path = resolve_output(args)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    doc = CaptureDoc(out_path)
+    doc = WRITERS[fmt](out_path)
 
     print("Clipboard capture running.")
     print(f"  Writing to: {out_path}")
+    if fmt != "docx" and not args.no_images:
+        print(f"  Pictures:   {doc.images_dir}\\")
     print("  Copy anything (Ctrl+A then Ctrl+C on a page) and it gets appended.")
     print("  Press Ctrl+C here to stop.\n")
 
@@ -532,9 +749,8 @@ def main(argv=None) -> int:
             if args.no_images:
                 ops = [op for op in ops if op[0] not in ("img", "rawimg")]
 
-            text_len = sum(len(op[1]) for op in ops if op[0] == "p") + \
-                sum(len(op[2]) for op in ops if op[0] == "h") + \
-                sum(len(op[1]) for op in ops if op[0] == "li")
+            text_len = sum(len(op[1]) for op in ops if op[0] in ("p", "pre", "li")) + \
+                sum(len(op[2]) for op in ops if op[0] == "h")
             has_image = any(op[0] in ("img", "rawimg") for op in ops)
             if not ops or (text_len < args.min_chars and not has_image):
                 continue
@@ -562,13 +778,10 @@ def main(argv=None) -> int:
             if doc.pending_save:
                 doc.save()
             print(f"Saved {doc.count} capture(s) and {doc.images} image(s) to:\n  {out_path}")
+            if fmt != "docx" and doc.images:
+                print(f"  Pictures in: {doc.images_dir}")
         else:
             print("Nothing was captured, so no file was written.")
-            try:
-                if os.path.exists(out_path) and doc.count == 0:
-                    os.remove(out_path)
-            except OSError:
-                pass
     return 0
 
 

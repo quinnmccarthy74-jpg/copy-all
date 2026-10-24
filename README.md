@@ -1,12 +1,13 @@
 # copy-all
 
-Watch the Windows clipboard and append everything you copy to a single Word
-document — text *and* pictures — until you stop it.
+Watch the Windows clipboard and append everything you copy to a single
+document — text *and* pictures — until you stop it. Choose a **Word**, a
+**Markdown** or a **plain text** file when it starts.
 
 You never touch the output file while you work. You just browse: on each page
 press **Ctrl+A** then **Ctrl+C**, and a moment later that page is another
-section of the `.docx`. Copy a screenshot or an image from a page and that
-lands in the document too.
+section of the document. Copy a screenshot or an image from a page and that
+lands in there too.
 
 ## Setup (once)
 
@@ -27,6 +28,14 @@ python capture_clipboard.py
 
 ```
 > run-capture.bat
+What should the captures be written to?
+
+  [1] Word document    .docx   - pictures embedded in the file itself
+  [2] Markdown file    .md     - pictures saved in a folder beside it
+  [3] Plain text file  .txt    - pictures saved in a folder beside it
+
+Choose 1-3 [1]: 1
+
 Clipboard capture running.
   Writing to: C:\Users\you\Documents\clipboard-capture_2026-10-24_1412.docx
   Copy anything (Ctrl+A then Ctrl+C on a page) and it gets appended.
@@ -46,12 +55,17 @@ never costs you more than the capture in flight.
 ## Options
 
 ```
-python capture_clipboard.py --out "C:\Users\you\Desktop\research.docx"
+python capture_clipboard.py --format md
+python capture_clipboard.py --out "C:\Users\you\Desktop\research.md"
 ```
+
+Give `--out` a `.docx`, `.md` or `.txt` name and the format is taken from it,
+so you are not asked.
 
 | Option | What it does |
 | --- | --- |
-| `--out PATH`, `-o` | Where to write the `.docx`. Default: `Documents\clipboard-capture_<date>.docx` |
+| `--format`, `-f` | `docx`, `md` or `txt` — skips the startup question |
+| `--out PATH`, `-o` | Where to write it. Default: `Documents\clipboard-capture_<date>.<ext>` |
 | `--no-images` | Text only — nothing is downloaded |
 | `--min-image-size N` | Skip images under N pixels a side (default 32, keeps out spacers and tracking pixels) |
 | `--image-timeout S` | How long to wait per image download (default 10s) |
@@ -63,13 +77,25 @@ Pass them through the launcher too: `run-capture.bat --no-images`
 
 ## What ends up in the document
 
-Each capture becomes its own page, headed with a number, a timestamp, and the
-page's URL. Underneath, in the order they appeared:
+Each capture is headed with a number, a timestamp and the page's URL — a new
+page in Word, a `---` section in Markdown, a `====` banner in text. Underneath,
+in the order they appeared:
 
 - headings, paragraphs and bullet lists
 - tables, flattened to one line per row with `|` between cells
-- preformatted / code blocks
-- images, scaled to the page width, with the `alt` text as a caption
+- preformatted / code blocks (fenced in Markdown, indented in text)
+- images, with the `alt` text kept as a caption
+
+Where the pictures go depends on the format:
+
+| Format | Pictures |
+| --- | --- |
+| `.docx` | embedded in the file, scaled to the page width — one self-contained file to send |
+| `.md` | saved as `img_0001.png`, `img_0002.jpg`, … in a `<name>_images` folder beside the file and linked with `![alt](...)` |
+| `.txt` | same folder, referenced as `[image: <name>_images/img_0001.png - alt text]` |
+
+For `.md` and `.txt`, keep that folder next to the file if you move it, or the
+pictures stop resolving.
 
 ## Worth knowing
 
